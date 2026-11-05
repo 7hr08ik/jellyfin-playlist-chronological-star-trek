@@ -41,11 +41,11 @@ Nothing is ever deleted. When verification passes, deleting the superseded playl
 Clone the repo and link the skill into your OpenCode project:
 
 ```bash
-git clone https://github.com/<you>/jellytrek.git ~/src/jellytrek
+git clone https://github.com/7hr08ik/jellyfin-trek-playlist.git ~/src/jellyfin-trek-playlist
 cd /path/to/your/project
 mkdir -p .opencode/skills .opencode/commands
-ln -s ~/src/jellytrek/skills/rebuild-trek-playlist .opencode/skills/rebuild-trek-playlist
-cp ~/src/jellytrek/commands/rebuild-trek-playlist.md .opencode/commands/
+ln -s ~/src/jellyfin-trek-playlist/skills/rebuild-trek-playlist .opencode/skills/rebuild-trek-playlist
+cp ~/src/jellyfin-trek-playlist/commands/rebuild-trek-playlist.md .opencode/commands/
 ```
 
 Then either run `/rebuild-trek-playlist` in OpenCode, or ask the agent to "rebuild the Star Trek playlist".
@@ -54,7 +54,7 @@ The command loads the skill and starts with `plan`.
 You can also run the script directly, without OpenCode, from a checkout:
 
 ```bash
-python3 ~/src/jellytrek/skills/rebuild-trek-playlist/scripts/trek_playlist.py plan
+python3 ~/src/jellyfin-trek-playlist/skills/rebuild-trek-playlist/scripts/trek_playlist.py plan
 ```
 
 ## Credentials
