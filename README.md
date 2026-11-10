@@ -64,9 +64,10 @@ Everything comes from the environment. Nothing is written to disk, echoed, or lo
 | Variable | Use |
 |---|---|
 | `JELLYFIN_URL` | Base URL, default `http://localhost:8096` |
-| `JELLYFIN_API_KEY` | API key. Enough for `plan`, `decide`, `create`, `verify` |
+| `JELLYFIN_API_KEY` | API key. Enough for `plan`, `create`, `verify`; `decide` needs none |
 | `JELLYFIN_USER` | Username or 32-character user id |
 | `JELLYFIN_PASSWORD` | Password for that user; required for `rename` |
+| `TREK_STATE_DIR` | Where decisions and plan state live; defaults beside the skill |
 
 **Why two kinds of credential?** Jellyfin resolves the calling user from the token when renaming a playlist.
 An API key authenticates as an administrator but carries no user id, so `POST /Playlists/{id}` returns
@@ -123,7 +124,7 @@ python3 "$TREK" decide --key 'SFA|1|3' --exclude --note "airs next week"
 ```
 
 Keys are `CODE|SEASON|EPISODE`, or `Film|<title>` for films. Decisions persist in
-`~/.local/state/trek-playlist/decisions.json` and are re-applied on every later run, so a judgment is made
+`<state-dir>/decisions.json` and are re-applied on every later run, so a judgment is made
 once. Re-run `plan` after each decision.
 
 ### 3. Rebuild
@@ -164,12 +165,17 @@ you.
 | `--playlist` | `Chronological Star Trek` (`TREK_PLAYLIST`) | Playlist name |
 | `--user` | `JELLYFIN_USER` | Username or user id |
 | `--password` | `JELLYFIN_PASSWORD` | Prefer the environment variable |
-| `--state-dir` | `~/.local/state/trek-playlist` | State and decisions |
+| `--state-dir` | `TREK_STATE_DIR`, else the skill's `refs/`, else the platform directory | State and decisions |
 | `--report-dir` | `./reports` | Where reports are written |
 | `--site-file` | — | Parse a saved copy of the guide instead of fetching it |
 | `--inventory-file` | — | Read a saved inventory instead of calling the API |
 | `--guide-url` | the viewing guide | Override the source |
 | `rename --force` | — | Rehearse a rename even when the plan is `IDENTICAL` |
+
+Decisions and plan state live beside the skill, in `refs/`. `TREK_STATE_DIR` overrides that; `--state-dir` overrides
+both; a read-only install falls back to `$XDG_STATE_HOME/trek-playlist` (`%LOCALAPPDATA%` on Windows,
+`~/Library/Application Support` on macOS). The first run copies an existing `~/.local/state/trek-playlist` across and
+prints what it copied.
 
 ## Matching
 
@@ -197,7 +203,7 @@ become two entries, and repeated positions collapse into one. The report states 
 ## The report
 
 `reports/rebuild-YYYY-MM-DD-HHMM.md` contains the verdict, server facts, the full mapping table
-(position, code, season, episode, canonical title, library title, item id, status, confidence, notes), every
+(position, code, season, episode, canonical title, library title, item id, status, tier, confidence, notes), every
 gap with links, the diff against the current playlist, the exact API calls a rebuild would make, and the
 verification results.
 
@@ -214,6 +220,7 @@ Reports describe your library, so `reports/` is gitignored.
 | A title is `AMBIGUOUS` | Two library items share it | `decide --item <id>` |
 | Seasons named "Series 1" | Cosmetic naming | No effect; matching uses `ParentIndexNumber` |
 | `BLOCKED` with a whole series missing | Not in the library | `decide --exclude`, or add the files and re-plan |
+| `series read returned 400 rows` | A library read filled its page limit | Raise the limit in the script; a full page may hide more rows |
 
 ## Limitations
 

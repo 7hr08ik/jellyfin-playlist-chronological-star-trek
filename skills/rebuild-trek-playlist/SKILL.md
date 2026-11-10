@@ -16,18 +16,37 @@ The work is done by one stdlib script. Read its output; do not re-implement the 
 - Credentials come from the environment (`JELLYFIN_API_KEY`, or `JELLYFIN_USER` + `JELLYFIN_PASSWORD`). Never echo them, paste them into a command line, or write them to a file. If none is set, stop and ask the user to export one.
 - If a step fails, report the error and the state; do not improvise a fix against the server.
 
-## Prerequisites
+## Before Phase 1 — the credential checklist
 
-Two ways in. A rebuild needs the first; the second is enough for `plan`, `decide` and `verify`.
-
-- **User session (required for `rename`):** set `JELLYFIN_USER` (username or id) and `JELLYFIN_PASSWORD`. The script logs in through `/Users/AuthenticateByName`, keeps the token in memory for that run, and never writes or prints it. An API key cannot rename: it has no user id, so Jellyfin answers `POST /Playlists/{id}` with 400.
-- **API key:** `JELLYFIN_API_KEY`. Works for every read and for `create`, which takes the user id in the body.
+Run this first, before any server read. It names both modes, so a missing credential is a question rather than a
+failed request:
 
 ```bash
-test -n "$JELLYFIN_PASSWORD" -o -n "$JELLYFIN_API_KEY" || echo "no credential is set"
+test -n "$JELLYFIN_API_KEY" && echo "API key mode"
+test -n "$JELLYFIN_USER" && test -n "$JELLYFIN_PASSWORD" && echo "user session mode"
+```
+
+- Neither set: ask the operator which mode they will use, name `JELLYFIN_API_KEY`, `JELLYFIN_USER` and
+  `JELLYFIN_PASSWORD`, and stop until one is supplied.
+- Only an API key: enough for `plan`, `create`, `decide` and `verify`. `rename` will be refused: an API key carries
+  no user id.
+- User and password: enough for every phase.
+
+Never put a password on the command line as a flag, and never `export` one you were given for a single run — pass it
+inline on that command only:
+
+```bash
+JELLYFIN_PASSWORD='…' python3 .opencode/skills/rebuild-trek-playlist/scripts/trek_playlist.py rename
 ```
 
 `JELLYFIN_URL` defaults to `http://localhost:8096`.
+
+### What each mode does
+
+- **User session:** `JELLYFIN_USER` (username or id) with `JELLYFIN_PASSWORD`. The script logs in through
+  `/Users/AuthenticateByName`, keeps the token in memory for that run, and never writes or prints it.
+- **API key:** `JELLYFIN_API_KEY`. Every read and `create`; `rename` is refused because the key has no user id, so
+  Jellyfin answers `POST /Playlists/{id}` with 400.
 
 ## Phase 1 — plan (read-only)
 
@@ -55,7 +74,29 @@ python3 .opencode/skills/rebuild-trek-playlist/scripts/trek_playlist.py decide \
   --key 'SFA|1|3' --exclude --note "not in library yet"
 ```
 
-Decisions persist in `~/.local/state/trek-playlist/decisions.json`. Re-run `plan` after each change. Never proceed to a write while the verdict is `BLOCKED`.
+Decisions persist in `~/.local/state/trek-playlist/decisions.json`; `decide` works without a credential. Re-run `plan` after each change. Never proceed to a write while the verdict is `BLOCKED`.
+
+## Review the gaps (before gate 1)
+
+Every row in the queue is a **gap** with a **proposal** — the matcher's best candidate, its rivals and the score. Offer
+the operator three answers for each: **accept** the proposal, **correct** it with another library item, or **exclude** the
+position. The plan prints the exact command for each row, so nothing has to be typed by hand:
+
+```bash
+# accept the proposal the plan printed
+decide --key 'SNW|2|10' --item <proposed id> --note "accepted proposal"
+
+# correct it with a different item
+decide --key 'SNW|2|10' --item <other id> --note "library copy"
+
+# exclude it
+decide --key 'SFA|1|3' --exclude --note "airs next week"
+```
+
+`plan --review-json` emits the same queue as JSON on stdout when you need to walk it in one pass. When the queue is
+empty, run `plan` again: the **verdict** at the gate is the one from that run, never the `BLOCKED` one from before.
+The answers are saved in `decisions.json`, so the next run applies them before every automatic tier and asks nothing
+about them again.
 
 ## Gate 1 — approval
 
@@ -96,12 +137,14 @@ Tell the user: the new playlist is verified, the old one is renamed and intact, 
 | Command | Writes? | Purpose |
 |---|---|---|
 | `plan` | report + local state | Fetch, match, diff, classify |
-| `decide` | local decisions file | Map or exclude one position |
+| `decide` | local decisions file | Accept, correct or exclude one position |
 | `rename` | playlist name only | Supersede the old playlist |
 | `rename --restore` | playlist name only | Undo the rename after a failed create |
 | `create` | new playlist | Create from the planned ids |
 | `verify` | report | Assert the new playlist |
 
-State: `~/.local/state/trek-playlist/<playlist-slug>.json`, decisions in `decisions.json` beside it. Reports: `reports/rebuild-*.md`.
+State: `<state-dir>/<playlist-slug>.json`, decisions in `decisions.json` beside it. The default is the skill's own
+`refs/` directory, then `TREK_STATE_DIR`, then a per-user platform directory when the install is read-only. Reports:
+`reports/rebuild-*.md`; the working copy is `reports/playlist.local.md`.
 
 Offline runs: `--site-file` and `--inventory-file` replace the network calls. Tests: `python3 -m unittest discover -s .opencode/skills/rebuild-trek-playlist/scripts`.

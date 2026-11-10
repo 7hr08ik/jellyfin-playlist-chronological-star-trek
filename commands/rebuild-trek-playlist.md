@@ -10,4 +10,8 @@ Start with the read-only plan:
 python3 .opencode/skills/rebuild-trek-playlist/scripts/trek_playlist.py plan
 ```
 
-Report the verdict and the report path. Stop if the verdict is `IDENTICAL`; resolve gaps if it is `BLOCKED`; ask for explicit approval before running `rename` or `create`. Never delete a playlist.
+Report the verdict and the report path. Stop if the verdict is `IDENTICAL`.
+
+If the verdict is `BLOCKED`, run the review: put each gap and its proposal to the user, record the answer with the
+`decide` command the plan printed, then run `plan` again. Ask for explicit approval before running `rename` or
+`create`, and only when that re-run is not `BLOCKED`. Never delete a playlist.

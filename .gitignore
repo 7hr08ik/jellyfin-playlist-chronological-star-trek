@@ -14,4 +14,14 @@ login.json
 .opencode/
 .codegraph/
 openspec/
+glossary/
+adr/
 .DS_Store
+AGENTS.md
+Project_Log.md
+Project_Notes.md
+
+# Skill-local state; see README
+skills/rebuild-trek-playlist/refs/decisions.json
+skills/rebuild-trek-playlist/refs/*.json
+!skills/rebuild-trek-playlist/refs/decisions.example.json

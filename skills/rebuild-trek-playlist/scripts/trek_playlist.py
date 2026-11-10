@@ -9,6 +9,7 @@ import html
 import json
 import os
 import re
+import shutil
 import sys
 import unicodedata
 import urllib.error
@@ -21,7 +22,8 @@ UA = ('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/130 Safari/537.36')
 DEFAULT_URL = 'http://localhost:8096'
 DEFAULT_PLAYLIST = 'Chronological Star Trek'
-STATE_ROOT = os.path.join(
+SKILL_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+LEGACY_STATE_ROOT = os.path.join(
     os.environ.get('XDG_STATE_HOME', os.path.expanduser('~/.local/state')),
     'trek-playlist')
 
@@ -109,6 +111,18 @@ def row_key(row):
     return '%s|%s|%s' % (row['code'], row['season'], row['ep'])
 
 
+FLOOR = 0.55          # below this no candidate is worth reporting
+LOW_CONF = {'episode': 0.80, 'film': 0.90}   # below this a match is a guess
+
+
+def build_proposal(scored, tier, floor=FLOOR):
+    """Best candidate plus the next two, from (score, item) pairs."""
+    picked = [(s, e) for s, e in scored if s >= floor][:3]
+    return [dict(item=e['Id'], title=e['Name'],
+                 season=e.get('ParentIndexNumber'), ep=e.get('IndexNumber'),
+                 tier=tier, score='%.2f' % s) for s, e in picked]
+
+
 def match_rows(rows, inventory, decisions):
     """Return one record per canonical position."""
     index = {name: entry['episodes'] for name, entry in inventory.items()}
@@ -118,7 +132,8 @@ def match_rows(rows, inventory, decisions):
         rec = dict(pos=pos, chap=row['chap'], code=row['code'],
                    season=row['season'], ep=row['ep'], title=row['title'],
                    units=row['units'], status='', tier='', items=[],
-                   libtitle='', libseason=None, libep=None, conf='', note='')
+                   libtitle='', libseason=None, libep=None, conf='', note='',
+                   proposal=None, low_conf=False)
         decision = decisions.get(row_key(row))
         if decision:
             if decision.get('exclude'):
@@ -150,10 +165,22 @@ def match_rows(rows, inventory, decisions):
             if not cands:
                 scored = sorted(((ratio(norm(row['title']), norm(f['Name'])), f)
                                  for f in films), reverse=True, key=lambda x: x[0])
-                if scored and scored[0][0] >= 0.90 and \
-                        (len(scored) == 1 or scored[1][0] < scored[0][0]):
-                    cands = [scored[0][1]]
-                    tier = 'fuzzy'
+                if scored and scored[0][0] >= 0.90:
+                    if len(scored) == 1 or scored[1][0] < scored[0][0]:
+                        cands = [scored[0][1]]
+                        tier = 'fuzzy'
+                    else:
+                        rivals = [f for s, f in scored if s >= 0.90]
+                        rec.update(status='AMBIGUOUS', tier='fuzzy',
+                                   conf='%.2f' % scored[0][0],
+                                   note='; '.join('%s %s' % (c['Name'], c['Id'])
+                                                  for c in rivals))
+                        rec['proposal'] = build_proposal(scored, 'fuzzy')
+                        out.append(rec)
+                        continue
+                elif scored:
+                    rec['proposal'] = build_proposal(scored, 'fuzzy')
+                    rec['low_conf'] = True
             if len(cands) == 1:
                 rec.update(status='MATCHED', tier=tier, items=[cands[0]['Id']],
                            libtitle=cands[0]['Name'], conf='1.00')
@@ -229,6 +256,9 @@ def match_rows(rows, inventory, decisions):
                                e['Name'], e.get('ParentIndexNumber'),
                                e.get('IndexNumber'), s, e['Id'])
                                for s, e in cand) or 'no candidate >= 0.55')
+                if cand:
+                    rec['proposal'] = build_proposal(cand, tier)
+                    rec['low_conf'] = best[0] < LOW_CONF['episode']
                 out.append(rec)
                 continue
 
@@ -254,6 +284,8 @@ def match_rows(rows, inventory, decisions):
                                note='; '.join('%s [S%sE%s] %s' % (
                                    e['Name'], e.get('ParentIndexNumber'),
                                    e.get('IndexNumber'), e['Id']) for e in c))
+                    rec['proposal'] = build_proposal(
+                        [(float(conf), e) for e in c], tier)
                     out.append(rec)
                     continue
         if len(c) > 1:
@@ -407,28 +439,39 @@ def folders(api, collection_type):
     return found
 
 
+def page_cap(items, limit, what):
+    """A full page may mean more rows exist: stop rather than truncate silently."""
+    if len(items) >= limit:
+        raise SystemExit('%s returned %d rows, its limit; raise the limit or page it'
+                         % (what, limit))
+    return items
+
+
 def discover(api):
     tv_folders = folders(api, 'tvshows')
     movies = folders(api, 'movies')[0]['Id']
     series = {}
     for folder in tv_folders:
-        for s in api.get('/Items', ParentId=folder['Id'], Recursive='true',
-                         IncludeItemTypes='Series', limit=400,
-                         Fields='Path,ProviderIds')['Items']:
+        rows = api.get('/Items', ParentId=folder['Id'], Recursive='true',
+                       IncludeItemTypes='Series', limit=400,
+                       Fields='Path,ProviderIds')['Items']
+        for s in page_cap(rows, 400, 'series read'):
             series[s['Id']] = s
     inventory = {}
     for s in series.values():
         if not s['Name'].startswith('Star Trek'):
             continue
-        eps = api.get('/Items', ParentId=s['Id'], Recursive='true',
-                      IncludeItemTypes='Episode', limit=500,
-                      Fields='Path,ProviderIds')['Items']
+        eps = page_cap(api.get('/Items', ParentId=s['Id'], Recursive='true',
+                                IncludeItemTypes='Episode', limit=500,
+                                Fields='Path,ProviderIds')['Items'],
+                       500, 'episode read for %s' % s['Name'])
         inventory[s['Name']] = {'Id': s['Id'],
                                 'ProviderIds': s.get('ProviderIds', {}),
                                 'episodes': eps}
-    films = api.get('/Items', ParentId=movies, Recursive='true',
-                    IncludeItemTypes='Movie', searchTerm='Star Trek',
-                    limit=100, Fields='Path,ProviderIds')['Items']
+    films = page_cap(api.get('/Items', ParentId=movies, Recursive='true',
+                              IncludeItemTypes='Movie', searchTerm='Star Trek',
+                              limit=100, Fields='Path,ProviderIds')['Items'],
+                     100, 'film read')
     inventory['__films__'] = {'Id': movies, 'ProviderIds': {}, 'episodes': films}
     return prepare(inventory)
 
@@ -449,7 +492,8 @@ def resolve_user(api, wanted=None):
 
 
 def find_playlist(api, name):
-    items = api.get('/Items', IncludeItemTypes='Playlist', Recursive='true', limit=200)['Items']
+    items = page_cap(api.get('/Items', IncludeItemTypes='Playlist', Recursive='true',
+                             limit=200)['Items'], 200, 'playlist read')
     found = [i for i in items if i['Name'] == name and i.get('Type') == 'Playlist']
     if len(found) > 1:
         raise SystemExit('%d playlists named %r: %s' % (
@@ -476,6 +520,55 @@ def item_name(api, user_id, item_id):
 
 
 # ---------------------------------------------------------------- state
+
+def platform_state_dir():
+    if sys.platform == 'win32':
+        base = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~/AppData/Local')
+    elif sys.platform == 'darwin':
+        base = os.path.expanduser('~/Library/Application Support')
+    else:
+        base = os.environ.get('XDG_STATE_HOME') or os.path.expanduser('~/.local/state')
+    return os.path.join(base, 'trek-playlist')
+
+
+def skill_state_dir():
+    """The skill's own refs/ directory, when the install is writable."""
+    refs = os.path.join(SKILL_ROOT, 'refs')
+    probe = os.path.join(refs, '.write-probe')
+    try:
+        os.makedirs(refs, exist_ok=True)
+        with open(probe, 'w') as fh:
+            fh.write('')
+        os.remove(probe)
+        return refs
+    except OSError:
+        return None
+
+
+def default_state_dir():
+    env = os.environ.get('TREK_STATE_DIR')
+    if env:
+        return os.path.abspath(os.path.expanduser(env))
+    return skill_state_dir() or platform_state_dir()
+
+
+def migrate_legacy_state(state_dir, legacy=None):
+    """Copy decisions and plan state from the old ~/.local/state directory."""
+    legacy = legacy or LEGACY_STATE_ROOT
+    if os.path.realpath(legacy) == os.path.realpath(state_dir) or not os.path.isdir(legacy):
+        return []
+    copied = []
+    os.makedirs(state_dir, exist_ok=True)
+    for name in sorted(os.listdir(legacy)):
+        if not name.endswith('.json'):
+            continue
+        dst = os.path.join(state_dir, name)
+        if os.path.exists(dst):
+            continue
+        shutil.copy2(os.path.join(legacy, name), dst)
+        copied.append(name)
+    return copied
+
 
 def state_path(state_dir, playlist):
     slug = re.sub(r'[^a-z0-9]+', '-', playlist.lower()).strip('-')
@@ -514,7 +607,7 @@ def diff_sequences(current, intended):
                if tag in ('delete', 'replace') for i in range(i1, i2)]
     changed = sum(max(i2 - i1, j2 - j1) for tag, i1, i2, j1, j2 in ops
                   if tag != 'equal')
-    first = next((j1 for tag, _, _, j1, j2 in ops if tag != 'equal'), None)
+    first = next((j1 + 1 for tag, _, _, j1, j2 in ops if tag != 'equal'), None)
     return dict(added=added, removed=removed, changed=changed,
                 first_divergence=first)
 
@@ -539,6 +632,36 @@ def gap_links(row, inventory):
     return links
 
 
+def review_entry(rec):
+    """One queue row, as printed and as JSON."""
+    return dict(position=rec['pos'], key=row_key(rec), title=rec['title'],
+                season=rec['season'], ep=rec['ep'], status=rec['status'],
+                tier=rec['tier'], low_confidence=rec['low_conf'],
+                proposal=rec['proposal'])
+
+
+def review_command(rec):
+    return "decide --key '%s' --item %s" % (row_key(rec), rec['proposal'][0]['item'])
+
+
+def print_review(rec):
+    head = 'GAP %d %s S%sE%s %s [%s]' % (rec['pos'], rec['code'], rec['season'],
+                                         rec['ep'], rec['title'], rec['status'])
+    if rec['low_conf']:
+        head += ' low confidence'
+    print(head)
+    for cand in rec['proposal'] or []:
+        print('  proposal: %r S%sE%s %s %s id=%s'
+              % (cand['title'], cand['season'], cand['ep'], cand['tier'],
+                 cand['score'], cand['item']))
+    if rec['proposal']:
+        print('  %s' % review_command(rec))
+        print("  or exclude: decide --key '%s' --exclude --note 'why'"
+              % row_key(rec))
+    else:
+        print('  no candidate above %.2f; see the report links' % FLOOR)
+
+
 # ---------------------------------------------------------------- commands
 
 def repo_root():
@@ -559,12 +682,12 @@ def cmd_plan(args):
         with open(args.inventory_file) as fh:
             inventory = prepare(json.load(fh))
     else:
-        inventory = discover(Api(args.url, args.key))
+        inventory = discover(Api(args.url, args.api_key))
 
     records = match_rows(rows, inventory, decisions)
     ids, collapsed = playlist_ids(records)
-    user = resolve_user(Api(args.url, args.key), args.user)
-    api = Api(args.url, args.key)
+    user = resolve_user(Api(args.url, args.api_key), args.user)
+    api = Api(args.url, args.api_key)
     pl = find_playlist(api, args.playlist)
     current = playlist_items(api, pl['Id'], user) if pl else []
     current_ids = [i['Id'] for i in current]
@@ -586,8 +709,12 @@ def cmd_plan(args):
                           'rebuild-%s.md' % now.strftime('%Y-%m-%d-%H%M'))
     write_report(report, args, verdict, records, ids, collapsed, gaps,
                  excluded, pl, current_ids, diff, inventory, now)
+    working = os.path.join(args.report_dir, 'playlist.local.md')
+    write_working_copy(working, args, records, now)
 
+    guide = [[pos, row_key(row), row['title']] for pos, row in enumerate(rows, 1)]
     state = dict(playlist=args.playlist, phase='planned', verdict=verdict,
+                 guide=guide,
                  ts=now.isoformat(timespec='seconds'), report=report,
                  intended=ids, excluded=[r['pos'] for r in excluded],
                  old=None, new=None)
@@ -596,6 +723,7 @@ def cmd_plan(args):
                             count=len(current_ids))
     save_json(state_path(args.state_dir, args.playlist), state)
 
+    print('state: %s' % args.state_dir)
     print('verdict: %s' % verdict)
     print('positions: %d  playlist entries: %d  excluded: %d  gaps: %d'
           % (len(records), len(ids), len(excluded), len(gaps)))
@@ -608,9 +736,12 @@ def cmd_plan(args):
               % (len(diff['added']), len(diff['removed']), diff['changed'],
                  diff['first_divergence']))
     if gaps:
+        print('review: %d gap(s) to resolve, then run plan again' % len(gaps))
         for r in gaps:
-            print('GAP %d %s S%sE%s %s [%s]' % (r['pos'], r['code'], r['season'],
-                                                r['ep'], r['title'], r['status']))
+            print_review(r)
+    if getattr(args, 'review_json', False):
+        print(json.dumps([review_entry(r) for r in gaps], indent=2))
+    print('working copy: %s' % working)
     print('report: %s' % report)
     return 0
 
@@ -673,13 +804,7 @@ def write_report(path, args, verdict, records, ids, collapsed, gaps,
         a('')
     a('## Mapping')
     a('')
-    a('| # | Code | S | E | Canonical title | Library title | Item ID | Status | Conf | Notes |')
-    a('|---|---|---|---|---|---|---|---|---|---|')
-    for r in records:
-        a('| %d | %s | %s | %s | %s | %s | %s | %s | %s | %s |'
-          % (r['pos'], r['code'], r['season'], r['ep'], cell(r['title']),
-             cell(r['libtitle']), ', '.join(r['items']), r['status'],
-             r['conf'], cell(r['note'])))
+    lines += mapping_lines(records)
     a('')
     a('## Planned API calls')
     a('')
@@ -694,6 +819,46 @@ def write_report(path, args, verdict, records, ids, collapsed, gaps,
     a('- Read the new playlist back; assert count, order, uniqueness, Episode/Movie types.')
     a('- Re-read the old playlist; assert it still exists under the superseded name with the same count.')
     a('- Compare every position against the intended list above.')
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w') as f:
+        f.write('\n'.join(lines) + '\n')
+
+
+def mapping_lines(records, review=False):
+    head = ('| # | Code | S | E | Canonical title | Library title | Item ID | '
+            'Status | Tier | Conf | Notes |')
+    rule = '|---|---|---|---|---|---|---|---|---|---|---|'
+    if review:
+        head = ('| # | Code | S | E | Canonical title | Library title | Item ID | '
+                'Status | Tier | Conf | Notes | Review |')
+        rule = '|---|---|---|---|---|---|---|---|---|---|---|---|'
+    out = [head, rule]
+    for r in records:
+        row = ('| %d | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |'
+               % (r['pos'], r['code'], r['season'], r['ep'], cell(r['title']),
+                  cell(r['libtitle']), ', '.join(r['items']), r['status'],
+                  r['tier'] or '-', r['conf'], cell(r['note'])))
+        if review:
+            row = row + ' %s |' % cell(review_cell(r))
+        out.append(row)
+    return out
+
+
+def review_cell(rec):
+    if not rec['proposal']:
+        return '-'
+    best = rec['proposal'][0]
+    return '%r %s %s id=%s%s' % (best['title'], best['tier'], best['score'],
+                                 best['item'], ' (low confidence)' if rec['low_conf'] else '')
+
+
+def write_working_copy(path, args, records, now):
+    lines = ['# Playlist working copy — %s' % now.strftime('%Y-%m-%d %H:%M'), '',
+             '**Server:** `%s` · **Playlist:** `%s` · **State:** `%s` · **Guide:** %s'
+             % (args.url, args.playlist, args.state_dir, args.guide_url), '']
+    lines += mapping_lines(records, review=True)
+    lines += ['', 'Overwritten on every plan run. Answers are recorded with `decide`,',
+              'not by editing this file.']
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'w') as f:
         f.write('\n'.join(lines) + '\n')
@@ -721,7 +886,7 @@ def cmd_rename(args):
         raise SystemExit('plan verdict is %s; nothing to rebuild' % state.get('verdict'))
     if state['phase'] not in ('planned', 'renamed'):
         raise SystemExit('rename not valid at phase %s' % state['phase'])
-    api = Api(args.url, args.key)
+    api = Api(args.url, args.api_key)
     user = resolve_user(api, args.user)
     old = state['old']
     if args.restore:
@@ -750,7 +915,7 @@ def cmd_create(args):
         raise SystemExit('rename the old playlist first (phase %s)' % state['phase'])
     if state.get('new'):
         raise SystemExit('a new playlist was already created: %s' % state['new']['id'])
-    api = Api(args.url, args.key)
+    api = Api(args.url, args.api_key)
     user = resolve_user(api, args.user)
     status, body = api.post('/Playlists', {
         'Name': args.playlist,
@@ -758,7 +923,9 @@ def cmd_create(args):
         'UserId': user,
         'MediaType': 'Video',
     })
-    pid = body['Id']
+    pid = (body or {}).get('Id')
+    if not pid:
+        raise SystemExit('create returned no playlist id (HTTP %s)' % status)
     state['phase'] = 'created'
     state['new'] = dict(id=pid, name=args.playlist)
     save_json(state_path(args.state_dir, args.playlist), state)
@@ -766,11 +933,36 @@ def cmd_create(args):
     return 0
 
 
+def guide_observation(state, args):
+    """Compare the guide's current order with the one the plan recorded."""
+    recorded = state.get('guide') or []
+    if not recorded:
+        return 'guide check skipped: the state records no order'
+    try:
+        if args.site_file:
+            with open(args.site_file, encoding='utf-8') as fh:
+                rows = parse_guide(fh.read())
+        else:
+            rows = parse_guide(fetch_guide(args.guide_url))
+    except (SystemExit, OSError, urllib.error.URLError) as exc:
+        return 'guide check skipped: %s' % exc
+    now = [[pos, row_key(row), row['title']] for pos, row in enumerate(rows, 1)]
+    moved = [n for n, (before, after) in enumerate(zip(recorded, now), 1)
+             if before[1] != after[1]]
+    if len(recorded) != len(now):
+        return ('guide check: %d positions recorded, %d now; moved at %s'
+                % (len(recorded), len(now), moved[:20] or 'none'))
+    if moved:
+        return 'guide check: %d position(s) moved; %s' % (len(moved), moved[:20])
+    return 'guide check: the guide still lists the recorded order'
+
+
 def cmd_verify(args):
     state = load_state(args)
     if not state.get('new'):
-        raise SystemExit('no new playlist in state')
-    api = Api(args.url, args.key)
+        raise SystemExit('no new playlist in state; '
+                         'run rename --restore to put the old playlist back')
+    api = Api(args.url, args.api_key)
     user = resolve_user(api, args.user)
     want = state['intended']
     items = playlist_items(api, state['new']['id'], user)
@@ -792,6 +984,7 @@ def cmd_verify(args):
             old_ok = False
     checks['old_intact'] = old_ok
     ok = all(checks.values())
+    observation = guide_observation(state, args)
     with open(state['report'], 'a') as f:
         f.write('\n## Verification — %s\n\n' % datetime.now().strftime('%Y-%m-%d %H:%M'))
         f.write('New playlist `%s` read back with %d entries.\n\n'
@@ -801,12 +994,14 @@ def cmd_verify(args):
             f.write('| %s | %s |\n' % (k, 'PASS' if v else 'FAIL'))
         if first_bad:
             f.write('\nFirst divergent position: %d\n' % first_bad)
+        f.write('\n%s\n' % observation)
         f.write('\n%s\n' % ('**PASS**' if ok else '**FAIL**'))
     print('verify: %s' % ('PASS' if ok else 'FAIL'))
     for k, v in checks.items():
         print('  %-11s %s' % (k, 'PASS' if v else 'FAIL'))
     if first_bad:
         print('  first divergent position: %d' % first_bad)
+    print('  %s' % observation)
     if ok:
         print('Old playlist is left in place for manual deletion after you check the new one.')
     return 0 if ok else 1
@@ -829,13 +1024,15 @@ def build_parser():
     p.add_argument('--user', default=os.environ.get('JELLYFIN_USER'))
     p.add_argument('--password', default=os.environ.get('JELLYFIN_PASSWORD'),
                    help='user password; prefer the JELLYFIN_PASSWORD environment variable')
-    p.add_argument('--state-dir', default=STATE_ROOT)
+    p.add_argument('--state-dir')
     p.add_argument('--report-dir', default=os.path.join(repo_root(), 'reports'))
     p.add_argument('--site-file')
     p.add_argument('--inventory-file')
     p.add_argument('--guide-url', default=GUIDE_URL)
     sub = p.add_subparsers(dest='cmd', required=True)
-    sub.add_parser('plan')
+    pl = sub.add_parser('plan')
+    pl.add_argument('--review-json', action='store_true',
+                    help='print the review queue as JSON on stdout')
     d = sub.add_parser('decide')
     d.add_argument('--key', required=True, help='CODE|S|E or Film|title')
     d.add_argument('--item')
@@ -852,12 +1049,18 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    args.key = os.environ.get('JELLYFIN_API_KEY')
+    args.state_dir = args.state_dir or default_state_dir()
+    copied = migrate_legacy_state(args.state_dir)
+    if copied:
+        print('state: copied %s from %s' % (', '.join(copied), LEGACY_STATE_ROOT))
+    args.api_key = os.environ.get('JELLYFIN_API_KEY')
+    if args.cmd == 'decide':
+        return cmd_decide(args)
     if args.password:
         if not args.user:
             raise SystemExit('JELLYFIN_USER (username) is required when a password is set')
-        args.key, args.user = authenticate(args.url, args.user, args.password)
-    if not args.key:
+        args.api_key, args.user = authenticate(args.url, args.user, args.password)
+    if not args.api_key:
         raise SystemExit('JELLYFIN_API_KEY is not set (or set JELLYFIN_USER and JELLYFIN_PASSWORD)')
     return {'plan': cmd_plan, 'decide': cmd_decide, 'rename': cmd_rename,
             'create': cmd_create, 'verify': cmd_verify}[args.cmd](args)
